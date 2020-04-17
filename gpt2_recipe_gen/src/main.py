@@ -102,15 +102,24 @@ class TextDataset(Dataset):
             logger.info("Creating features from dataset file at %s", directory)
 
             self.examples = []
+            tokenized_texts = []
+            too_long = 0
             with open(file_path, encoding="utf-8") as f:
-                text = f.read()
+                for line in f:
+                    line = line.strip()
 
-            tokenized_text = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(text))
+                    tokenized_text = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(line))
 
-            for i in range(0, len(tokenized_text) - block_size + 1, block_size):  # Truncate in block of block_size
-                self.examples.append(tokenizer.build_inputs_with_special_tokens(tokenized_text[i : i + block_size]))
-            # Note that we are loosing the last truncated example here for the sake of simplicity (no padding)
-            # If your dataset is small, first you should loook for a bigger one :-) and second you
+                    if len(tokenized_text) >= block_size:
+                        too_long += 1
+                        continue
+
+                    tokenized_texts.extend(tokenized_text)
+
+            for i in range(0, len(tokenized_texts) - block_size + 1, block_size):  # Truncate in block of block_size
+                self.examples.append(tokenizer.build_inputs_with_special_tokens(tokenized_texts[i : i + block_size]))
+            # Note that we are losing the last truncated example here for the sake of simplicity (no padding)
+            # If your dataset is small, first you should look for a bigger one :-) and second you
             # can change this behavior by adding (model specific) padding.
 
             logger.info("Saving features into cached file %s", cached_features_file)
@@ -173,8 +182,23 @@ def _sorted_checkpoints(args, checkpoint_prefix="checkpoint", use_mtime=False) -
             if regex_match and regex_match.groups():
                 ordering_and_checkpoint_path.append((int(regex_match.groups()[0]), path))
 
+    if len(ordering_and_checkpoint_path) == 0:
+        data_dir = os.getenv('PT_DATA_DIR')
+        output_foldername = os.path.basename(os.path.normpath(args.output_dir))
+        first_part = os.path.join(data_dir, output_foldername)
+        glob_checkpoints = glob.glob(os.path.join(first_part, "{}-*".format(checkpoint_prefix)))
+
+        for path in glob_checkpoints:
+            if use_mtime:
+                ordering_and_checkpoint_path.append((os.path.getmtime(path), path))
+            else:
+                regex_match = re.match(".*{}-([0-9]+)".format(checkpoint_prefix), path)
+                if regex_match and regex_match.groups():
+                    ordering_and_checkpoint_path.append((int(regex_match.groups()[0]), path))
+
     checkpoints_sorted = sorted(ordering_and_checkpoint_path)
     checkpoints_sorted = [checkpoint[1] for checkpoint in checkpoints_sorted]
+
     return checkpoints_sorted
 
 
@@ -197,43 +221,58 @@ def _rotate_checkpoints(args, checkpoint_prefix="checkpoint", use_mtime=False) -
 
 
 def mask_tokens(inputs: torch.Tensor, tokenizer: PreTrainedTokenizer, args) -> Tuple[torch.Tensor, torch.Tensor]:
-    """ Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. """
+    """ Prepare masked tokens inputs/labels for masked language modeling:
+    mask the gold text."""
 
     if tokenizer.mask_token is None:
         raise ValueError(
             "This tokenizer does not have a mask token which is necessary for masked language modeling. Remove the --mlm flag if you want to use this tokenizer."
         )
 
+    def get_last_occurrence(token_list, token):
+        for i in reversed(range(len(token_list))):
+            if token_list[i] == token:
+                return i
+        raise ValueError('{} is not in list'.format(token))
+
+    end_of_prompt_id = tokenizer.convert_tokens_to_ids(
+        tokenizer.tokenize(args.end_of_prompt_token))[0]
+
+    if args.end_of_prompt_token == '<inst>':
+        backup_end_of_prompt_id = tokenizer.convert_tokens_to_ids(
+        tokenizer.tokenize('<endofings>'))[0]
+
+    cutoffs = []
+    for example in inputs:
+        try:
+            cutoff = get_last_occurrence(example, end_of_prompt_id)
+        except:
+            if args.end_of_prompt_token == '<inst>':
+                # fallback for first example is '<endofings>'
+                cutoff = get_last_occurrence(example, backup_end_of_prompt_id)
+            # print('ERROR GETTING LAST OCCURRENCE')
+            # print(end_of_prompt_id)
+            # print(example)
+            # cutoff = len(example)
+        cutoffs.append(cutoff)
+
     labels = inputs.clone()
-    # We sample a few tokens in each sequence for masked-LM training (with probability args.mlm_probability defaults to 0.15 in Bert/RoBERTa)
-    probability_matrix = torch.full(labels.shape, args.mlm_probability)
-    special_tokens_mask = [
-        tokenizer.get_special_tokens_mask(val, already_has_special_tokens=True) for val in labels.tolist()
-    ]
-    probability_matrix.masked_fill_(torch.tensor(special_tokens_mask, dtype=torch.bool), value=0.0)
-    if tokenizer._pad_token is not None:
-        padding_mask = labels.eq(tokenizer.pad_token_id)
-        probability_matrix.masked_fill_(padding_mask, value=0.0)
-    masked_indices = torch.bernoulli(probability_matrix).bool()
-    labels[~masked_indices] = -100  # We only compute loss on masked tokens
 
-    # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
-    indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
-    inputs[indices_replaced] = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
+    for i, input_example in enumerate(inputs):
+        # replace gold text in input with mask tokens
+        input_example[cutoffs[i]+1:] = tokenizer.convert_tokens_to_ids(tokenizer.mask_token)
 
-    # 10% of the time, we replace masked input tokens with random word
-    indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-    random_words = torch.randint(len(tokenizer), labels.shape, dtype=torch.long)
-    inputs[indices_random] = random_words[indices_random]
+    for i, label_example in enumerate(labels):
+        # mask the prompt labels (we only compute loss on unmasked labels)
+        label_example[:cutoffs[i]+1] = -100
 
-    # The rest of the time (10% of the time) we keep the masked input tokens unchanged
     return inputs, labels
 
 
 def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedTokenizer) -> Tuple[int, float]:
     """ Train the model """
     if args.local_rank in [-1, 0]:
-        tb_writer = SummaryWriter()
+        tb_writer = SummaryWriter(log_dir=os.getenv('PT_DATA_DIR', 'data'))
 
     args.train_batch_size = args.per_gpu_train_batch_size * max(1, args.n_gpu)
 
@@ -286,7 +325,7 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
         model, optimizer = amp.initialize(model, optimizer, opt_level=args.fp16_opt_level)
 
     # multi-gpu training (should be after apex fp16 initialization)
-    if args.n_gpu > 1:
+    if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
         model = torch.nn.DataParallel(model)
 
     # Distributed training (should be after apex fp16 initialization)
@@ -341,21 +380,19 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
     for _ in train_iterator:
         epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
-            try:
-                print("PROGRESS: {}%".format(step/len(epoch_iterator) * 100))
-            except:
-                print('tqdm printing error')
-
             # Skip past any already trained steps if resuming training
             if steps_trained_in_current_epoch > 0:
                 steps_trained_in_current_epoch -= 1
                 continue
 
+            print("PROGRESS: {}%".format(step/len(epoch_iterator)/args.num_train_epochs * 100))
+
             inputs, labels = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
             inputs = inputs.to(args.device)
             labels = labels.to(args.device)
             model.train()
-            outputs = model(inputs, masked_lm_labels=labels) if args.mlm else model(inputs, labels=labels)
+            outputs = model(inputs, labels=labels)
+            # outputs = model(inputs, masked_lm_labels=labels) if args.mlm else model(inputs, labels=labels)
             loss = outputs[0]  # model outputs are always tuple in transformers (see doc)
 
             if args.n_gpu > 1:
@@ -370,6 +407,7 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
                 loss.backward()
 
             tr_loss += loss.item()
+
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
@@ -379,6 +417,8 @@ def train(args, train_dataset, model: PreTrainedModel, tokenizer: PreTrainedToke
                 scheduler.step()  # Update learning rate schedule
                 model.zero_grad()
                 global_step += 1
+
+                print("EVALERR: {}".format(tr_loss / global_step))
 
                 if args.local_rank in [-1, 0] and args.logging_steps > 0 and global_step % args.logging_steps == 0:
                     # Log metrics
@@ -449,7 +489,7 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
     )
 
     # multi-gpu evaluate
-    if args.n_gpu > 1:
+    if args.n_gpu > 1 and not isinstance(model, torch.nn.DataParallel):
         model = torch.nn.DataParallel(model)
 
     # Eval!
@@ -466,7 +506,8 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
         labels = labels.to(args.device)
 
         with torch.no_grad():
-            outputs = model(inputs, masked_lm_labels=labels) if args.mlm else model(inputs, labels=labels)
+            outputs = model(inputs, labels=labels)
+            # outputs = model(inputs, masked_lm_labels=labels) if args.mlm else model(inputs, labels=labels)
             lm_loss = outputs[0]
             eval_loss += lm_loss.mean().item()
         nb_eval_steps += 1
@@ -474,7 +515,8 @@ def evaluate(args, model: PreTrainedModel, tokenizer: PreTrainedTokenizer, prefi
     eval_loss = eval_loss / nb_eval_steps
     perplexity = torch.exp(torch.tensor(eval_loss))
 
-    result = {"perplexity": perplexity}
+    result = {"eval_loss": eval_loss,
+              "perplexity": perplexity}
 
     output_eval_file = os.path.join(eval_output_dir, prefix, "eval_results.txt")
     with open(output_eval_file, "w") as writer:
@@ -492,7 +534,7 @@ def main():
     # Required parameters
     parser.add_argument(
         "--train_data_file",
-        default=os.getenv('PT_DATA_DIR', 'data') + '/recipe_generation_train.txt',
+        default='recipe_generation_train_sample.txt',
         type=str,
         help="The input training data file (a text file)."
     )
@@ -509,7 +551,7 @@ def main():
     # Other parameters
     parser.add_argument(
         "--eval_data_file",
-        default=os.getenv('PT_DATA_DIR', 'data') + '/recipe_generation_tune.txt',
+        default='recipe_generation_tune_sample.txt',
         type=str,
         help="An optional input evaluation data file to evaluate the perplexity on (a text file).",
     )
@@ -629,6 +671,7 @@ def main():
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
     parser.add_argument("--server_ip", type=str, default="", help="For distant debugging.")
     parser.add_argument("--server_port", type=str, default="", help="For distant debugging.")
+    parser.add_argument("--end_of_prompt_token", type=str, default="", help="Token marking end of prompt")
     args = parser.parse_args()
 
     if args.model_type in ["bert", "roberta", "distilbert", "camembert"] and not args.mlm:
@@ -653,12 +696,16 @@ def main():
         and os.listdir(args.output_dir)
         and args.do_train
         and not args.overwrite_output_dir
+        and not args.should_continue
     ):
         raise ValueError(
             "Output directory ({}) already exists and is not empty. Use --overwrite_output_dir to overcome.".format(
                 args.output_dir
             )
         )
+
+    args.train_data_file = '/alhegel/scrapes/philly/gpt2_recipe_gen/data/test.txt'#os.getenv('PT_DATA_DIR', 'data') + '/' + args.train_data_file
+    args.eval_data_file = os.getenv('PT_DATA_DIR', 'data') + '/' + args.eval_data_file
 
     # Setup distant debugging if needed
     if args.server_ip and args.server_port:
@@ -738,28 +785,53 @@ def main():
         logger.info("Training new model from scratch")
         model = model_class(config=config)
 
+    if args.end_of_prompt_token == 'inst':
+        args.end_of_prompt_token = '<inst>'
+
     # Add special tokens for recipe task
     special_tokens_dict = {'bos_token': '<|startoftext|>',
                            'eos_token': '<|endoftext|>',
+                           'mask_token': '<|mask|>',
                            'additional_special_tokens': [
                                '<endoftitle>', '<ing>', '<endofings>',
-                               '<inst>', '<endofinst>',
-                               '<target:easy>', '<target:healthy>',
-                               '<target:low-cholesterol>',
-                               '<target:gluten-free>', '<target:vegan>',
-                               '<target:vegetarian>', '<target:inexpensive>',
-                               '<target:sweet>', '<target:gluten-free>',
-                               '<target:dairy-free>', '<target:paleo>',
-                               '<target:kosher>',
-                               '<target:non-easy>', '<target:non-healthy>',
-                               '<target:non-low-cholesterol>',
-                               '<target:non-gluten-free>', '<target:non-vegan>',
-                               '<target:non-vegetarian>', '<target:non-inexpensive>',
-                               '<target:non-sweet>', '<target:non-gluten-free>',
-                               '<target:non-dairy-free>', '<target:non-paleo>',
-                               '<target:non-kosher>'
+                               '<inst>', '<endofinst>', '<noings>',
+                               '<endofrecipe>', '<endofprompt>',
+                               '<source:vegan>', '<target:vegan>',
+                               '<source:non-vegan>', '<target:non-vegan>',
+                               '<source:vegetarian>', '<target:vegetarian>',
+                               '<source:non-vegetarian>', '<target:non-vegetarian>',
+                               '<source:dairy-free>', '<target:dairy-free>',
+                               '<source:non-dairy-free>', '<target:non-dairy-free>',
+                               '<source:egg-free>', '<target:egg-free>',
+                               '<source:non-egg-free>', '<target:non-egg-free>',
+                               '<source:fish-free>', '<target:fish-free>',
+                               '<source:non-fish-free>', '<target:non-fish-free>',
+                               '<source:shellfish-free>', '<target:shellfish-free>',
+                               '<source:non-shellfish-free>', '<target:non-shellfish-free>',
+                               '<source:alcohol-free>', '<target:alcohol-free>',
+                               '<source:non-alcohol-free>', '<target:non-alcohol-free>',
+                               '<source:nut-free>', '<target:nut-free>',
+                               '<source:non-nut-free>', '<target:non-nut-free>',
+                            #    '<source:gluten-free>', '<target:gluten-free>',
+                            #    '<source:non-gluten-free>', '<target:non-gluten-free>',
+                            #    '<source:paleo>', '<target:paleo>',
+                            #    '<source:non-paleo>', '<target:non-paleo>',
+                            #    '<source:kosher>', '<target:kosher>',
+                            #    '<source:non-kosher>', '<target:non-kosher>',
+                            #    '<source:easy>', '<target:easy>',
+                            #    '<source:non-easy>', '<target:non-easy>',
+                            #    '<source:breakfast>', '<target:breakfast>',
+                            #    '<source:non-breakfast>', '<target:non-breakfast>',
+                            #    '<source:dessert>', '<target:dessert>',
+                            #    '<source:non-dessert>', '<target:non-dessert>',
+                            #    '<source:appetizer>', '<target:appetizer>',
+                            #    '<source:non-appetizer>', '<target:non-appetizer>',
+                            #    '<source:sweet>', '<target:sweet>',
+                            #    '<source:non-sweet>', '<target:non-sweet>',
+                            #    '<source:summer>', '<target:summer>',
+                            #    '<source:non-summer>', '<target:non-summer>',
                            ]}
-    num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
+    tokenizer.add_special_tokens(special_tokens_dict)
     model.resize_token_embeddings(len(tokenizer))
 
     model.to(args.device)
@@ -775,6 +847,14 @@ def main():
             torch.distributed.barrier()  # Barrier to make sure only the first process in distributed training process the dataset, and the others will use the cache
 
         train_dataset = load_and_cache_examples(args, tokenizer, evaluate=False)
+
+        # automatically set save_steps and save_total_limit from dataset size
+        dataset_len = len(train_dataset)
+        iters = dataset_len//(args.per_gpu_train_batch_size * args.n_gpu)
+        args.save_steps = iters/2
+        args.save_total_limit = args.num_train_epochs*2
+        print('&&&&&&&&&& save_steps:', str(args.save_steps))
+        print('&&&&&&&&&& save_total_limit:', str(args.save_total_limit))
 
         if args.local_rank == 0:
             torch.distributed.barrier()
