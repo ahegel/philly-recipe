@@ -1,0 +1,105 @@
+description: GPT-2 Question Generation
+
+target:
+  # which virtual cluster you belong to (msrlabs, etc.). Everyone has access to "msrlabs".
+  vc: resrchprojvc21
+  # physical cluster to use (cam, gcr, rr1, rr2) or Azure clusters (eu1, eu2, etc.)
+  cluster: rr1
+
+environment:
+  image: microsoft_pytorch:v1.2.0_gpu_cuda9.0_py36_release_gpuenv_hvd0.16.2
+  registry: phillyregistry.azurecr.io
+  setup:
+  - source setup.sh
+
+code:
+  # local directory of the code. this will be uploaded to the server.
+  # $CONFIG_DIR is expanded to the directory of this config file
+  local_dir: $CONFIG_DIR/src
+
+data:
+  local_dir: $CONFIG_DIR/data
+  remote_dir: data
+
+# list of jobs to run
+jobs:
+- name: recipe-qgen
+  sku: G4
+  command:
+  - python main.py --model_type=gpt2
+    --model_name_or_path=gpt2-medium
+    --do_train
+    --do_eval
+    --eval_all_checkpoints
+    --save_steps=10000
+    --save_total_limit=5
+    --num_train_epochs=10
+    --block_size=256
+    --per_gpu_train_batch_size=8
+    --per_gpu_eval_batch_size=8
+    --train_data_file=recipe_gpt2_train.txt
+    --eval_data_file=recipe_gpt2_tune.txt
+- name: amazon-qgen
+  sku: G4
+  command:
+  - python main.py --model_type=gpt2
+    --model_name_or_path=gpt2-medium
+    --do_train
+    --do_eval
+    --eval_all_checkpoints
+    --save_steps=10000
+    --save_total_limit=5
+    --num_train_epochs=10
+    --block_size=256
+    --per_gpu_train_batch_size=8
+    --per_gpu_eval_batch_size=8
+    --train_data_file=amazon_gpt2_train.txt
+    --eval_data_file=amazon_gpt2_tune.txt
+- name: stackexchange-qgen
+  sku: G4
+  command:
+  - python main.py --model_type=gpt2
+    --model_name_or_path=gpt2-medium
+    --do_train
+    --do_eval
+    --eval_all_checkpoints
+    --save_steps=10000
+    --save_total_limit=5
+    --num_train_epochs=10
+    --block_size=256
+    --per_gpu_train_batch_size=8
+    --per_gpu_eval_batch_size=8
+    --train_data_file=stackexchange_gpt2_train.txt
+    --eval_data_file=stackexchange_gpt2_tune.txt
+- name: combined-qgen-prefix
+  sku: G4
+  command:
+  - python main.py --model_type=gpt2
+    --model_name_or_path=gpt2-medium
+    --do_train
+    --do_eval
+    --eval_all_checkpoints
+    --save_steps=10000
+    --save_total_limit=5
+    --num_train_epochs=10
+    --block_size=256
+    --per_gpu_train_batch_size=8
+    --per_gpu_eval_batch_size=8
+    --train_data_file=qgen_pre_train.txt
+    --eval_data_file=qgen_pre_tune.txt
+- name: combined-qgen-suffix
+  sku: G4
+  command:
+  - python main.py --model_type=gpt2
+    --model_name_or_path=gpt2-medium
+    --do_train
+    --do_eval
+    --eval_all_checkpoints
+    --save_steps=10000
+    --save_total_limit=5
+    --num_train_epochs=10
+    --block_size=256
+    --per_gpu_train_batch_size=8
+    --per_gpu_eval_batch_size=8
+    --train_data_file=qgen_suf_train.txt
+    --eval_data_file=qgen_suf_tune.txt
